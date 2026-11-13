@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Map Tactical Editor</title>
+<style>
+body { margin: 0; background: #222; color: #fff; font-family: Arial, sans-serif; }
+#toolbar { background: #333; padding: 8px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+canvas { background: #111; display: block; margin: 0 auto; cursor: crosshair; width: 100%; max-width: 1200px; height: auto; }
+input[type=color], select, button, input[type=number] { background: #444; color: #ffffff; border: none; padding: 6px; border-radius: 4px; }
+button:hover, input[type=number]:hover { background: #555; }
+.layerToggle { display:flex; align-items:center; gap:4px; margin-left:8px; }
+#accessPanel { background:#292929; padding:8px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+#accessStatus { color:#ddd; }
+</style>
+</head>
+<body>
+<div id="accessPanel">
+  <input type="email" id="loginEmail" placeholder="Електронна пошта" autocomplete="email">
+  <button id="sendLoginLink">Надіслати посилання для входу</button>
+  <button id="signOut" hidden>Вийти</button>
+  <span id="accessStatus" role="status">Потрібен вхід</span>
+</div>
+<div id="toolbar">
+  <select id="shapeType" data-editor-only>
+    <option value="circle">Коло</option>
+    <option value="square">Квадрат</option>
+    <option value="diamond">Ромб</option>
+    <option value="triangle">Трикутник</option>
+    <option value="radiation">Радіація</option>
+  </select>
+  <input type="color" id="colorPicker" value="#ff0000" data-editor-only>
+  <input type="color" id="textColorPicker" value="#ffff00" title="Колір тексту" data-editor-only>
+  <input type="number" id="markerSize" value="20" min="5" max="100" style="width:60px;" data-editor-only>
+  <button id="addMarker" data-editor-only>Додати мітку</button>
+  <button id="drawZone" data-editor-only>Обвести зону</button>
+  <button id="drawRoute" data-editor-only>Маршрут</button>
+  <button id="addNote" data-editor-only>Текст</button>
+  <button id="eraseElement" data-editor-only>Стерти</button>
+  <button id="eraseAll" data-editor-only>Стерти все</button>
+  <button id="toggleGrid">Сітка вкл/викл</button>
+  <button id="zoomIn">+</button>
+  <button id="zoomOut">-</button>
+  <button id="saveMap" data-editor-only>Зберегти .maptacmd</button>
+  <button id="loadMap" data-editor-only>Завантажити .maptacmd</button>
+  <div class="layerToggle"><input type="checkbox" id="showMarkers" checked><label>Мітки</label></div>
+  <div class="layerToggle"><input type="checkbox" id="showRoutes" checked><label>Маршрути</label></div>
+  <div class="layerToggle"><input type="checkbox" id="showZones" checked><label>Зони</label></div>
+  <div class="layerToggle"><input type="checkbox" id="showNotes" checked><label>Назви</label></div>
+</div>
+
+<canvas id="mapCanvas" width="1200" height="1200"></canvas>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+const SUPABASE_URL = 'https://YOUR_PROJECT_ID.supabase.co';
+const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
+const MAP_BUCKET = 'map-assets';
+const MAP_BACKGROUND = 'shared-map.jpg';
+let supabaseClient = null;
+let currentRole = null;
+let mapSubscription = null;
+let saveTimer = null;
+let mapImageUrl = null;
+
+  let redrawRequested = false;
+
+function requestDraw(){
+  if(!redrawRequested){
+    redrawRequested = true;
+    requestAnimationFrame(() => {
+      redrawRequested = false;
+      draw();
+    });
+  }
+}
+const canvas=document.getElementById('mapCanvas');
+const ctx=canvas.getContext('2d');
+
+let mapImage=null;
+let mapScale=1;
+let zoom=1.0, offsetX=0, offsetY=0;
+let gridVisible=true;
+let objects=[];
+let currentAction=null;
+let tempPoints=[];
+let previewPoint=null;
+let isPanning=false;
+let panStart={x:0,y:0};
+let panOffsetStart={x:0,y:0};
+let eraseMode=false;
+let showMarkers=document.getElementById('showMarkers');
+let showRoutes=document.getElementById('showRoutes');
+let showZones=document.getElementById('showZones');
+let showNotes=document.getElementById('showNotes');
+let textColorPicker = document.getElementById('textColorPicker');
+
+const accessStatus = document.getElementById('accessStatus');
+
+function updateAccessControls(){
+  const canEdit = currentRole === 'editor';
+  document.querySelectorAll('[data-editor-only]').forEach(control=>{
+    control.disabled = !canEdit;
+  });
+  document.getElementById('loginEmail').hidden = Boolean(currentRole);
+  document.getElementById('sendLoginLink').hidden = Boolean(currentRole);
+  document.getElementById('signOut').hidden = !currentRole;
+}
+
+function queueSharedSave(){
+  if(currentRole !== 'editor' || !supabaseClient) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async ()=>{
+    const snapshot = JSON.parse(JSON.stringify(objects));
+    const { error } = await supabaseClient
+      .from('map_state')
+      .update({ objects: snapshot, updated_at: new Date().toISOString() })
+      .eq('id', 1);
+    if(error) accessStatus.textContent = `Помилка збереження: ${error.message}`;
+    else accessStatus.textContent = 'Зміни збережено';
+  }, 300);
+}
+
+async function loadSharedMap(){
+  const { data, error } = await supabaseClient
+    .from('map_state')
+    .select('objects')
+    .eq('id', 1)
+    .single();
+  if(error) throw error;
+  objects = Array.isArray(data.objects) ? data.objects : [];
+  requestDraw();
+}
+
+async function loadSharedBackground(){
+  const { data, error } = await supabaseClient
+    .storage
+    .from(MAP_BUCKET)
+    .download(MAP_BACKGROUND);
+  if(error) throw error;
+
+  const imageUrl = URL.createObjectURL(data);
+  const image = new Image();
+  try{
+    await new Promise((resolve, reject)=>{
+      image.onload = resolve;
+      image.onerror = ()=>reject(new Error('Файл спільної карти не вдалося відкрити'));
+      image.src = imageUrl;
+    });
+  }catch(error){
+    URL.revokeObjectURL(imageUrl);
+    throw error;
+  }
+
+  if(mapImageUrl) URL.revokeObjectURL(mapImageUrl);
+  mapImageUrl = imageUrl;
+  mapImage = image;
+  mapScale = Math.min(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight);
+  requestDraw();
+}
+
+async function activateSession(session){
+  if(!session){
+    currentRole = null;
+    currentAction = null;
+    objects = [];
+    mapImage = null;
+    mapScale = 1;
+    if(mapImageUrl) URL.revokeObjectURL(mapImageUrl);
+    mapImageUrl = null;
+    if(mapSubscription) supabaseClient.removeChannel(mapSubscription);
+    mapSubscription = null;
+    updateAccessControls();
+    accessStatus.textContent = 'Потрібен вхід';
+    requestDraw();
+    return;
+  }
+
+  const email = session.user.email.toLowerCase();
+  const { data: access, error } = await supabaseClient
+    .from('map_access')
+    .select('role')
+    .eq('email', email)
+    .eq('enabled', true)
+    .maybeSingle();
+
+  if(error || !access){
+    currentRole = null;
+    updateAccessControls();
+    accessStatus.textContent = error ? `Помилка перевірки доступу: ${error.message}` : 'Ця пошта не має доступу';
+    await supabaseClient.auth.signOut();
+    return;
+  }
+
+  currentRole = access.role;
+  updateAccessControls();
+  try{
+    await loadSharedMap();
+    await loadSharedBackground();
+    accessStatus.textContent = currentRole === 'editor' ? 'Роль: редактор' : 'Роль: перегляд';
+  }catch(error){
+    accessStatus.textContent = `Помилка завантаження карти: ${error.message}`;
+  }
+
+  if(mapSubscription) supabaseClient.removeChannel(mapSubscription);
+  mapSubscription = supabaseClient
+    .channel('shared-map-state')
+    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'map_state', filter: 'id=eq.1' }, payload=>{
+      if(Array.isArray(payload.new.objects)){
+        objects = payload.new.objects;
+        requestDraw();
+      }
+    })
+    .subscribe();
+}
+
+async function initializeAccess(){
+  updateAccessControls();
+  if(SUPABASE_URL.includes('YOUR_PROJECT_ID') || SUPABASE_ANON_KEY.includes('YOUR_SUPABASE_ANON_KEY')){
+    accessStatus.textContent = 'Налаштуйте SUPABASE_URL та SUPABASE_ANON_KEY у коді';
+    return;
+  }
+  if(!window.supabase){
+    accessStatus.textContent = 'Не вдалося завантажити Supabase';
+    return;
+  }
+
+  supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  supabaseClient.auth.onAuthStateChange((_event, session)=>{
+    setTimeout(()=>activateSession(session), 0);
+  });
+
+  document.getElementById('sendLoginLink').addEventListener('click', async ()=>{
+    const email = document.getElementById('loginEmail').value.trim().toLowerCase();
+    if(!email){
+      accessStatus.textContent = 'Введіть електронну пошту';
+      return;
+    }
+    const { error } = await supabaseClient.auth.signInWithOtp({
+      email,
+      options: { emailRedirectTo: window.location.href }
+    });
+    accessStatus.textContent = error ? `Помилка входу: ${error.message}` : 'Посилання для входу надіслано на пошту';
+  });
+
+  document.getElementById('signOut').addEventListener('click', async ()=>{
+    await supabaseClient.auth.signOut();
+  });
+}
+
+function draw(){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.setTransform(zoom*mapScale,0,0,zoom*mapScale,offsetX,offsetY);
+  if(mapImage) ctx.drawImage(mapImage,0,0);
+  if(gridVisible) drawGrid();
+  for(let o of objects){
+    if(o.type==='note' && !showNotes.checked) continue;
+    if((o.type==='circle'||o.type==='square'||o.type==='diamond'||o.type==='triangle'||o.type==='radiation') && !showMarkers.checked) continue;
+    if(o.type==='zone' && !showZones.checked) continue;
+    if(o.type==='route' && !showRoutes.checked) continue;
+    drawObject(o);
+  }
+  if((currentAction==='zone'||currentAction==='route') && tempPoints.length>0){
+    ctx.strokeStyle='red';
+    ctx.fillStyle='rgba(255,0,0,0.2)';
+    ctx.lineWidth=1.5;
+    if(currentAction==='zone'){
+      ctx.beginPath();
+      ctx.moveTo(tempPoints[0].x,tempPoints[0].y);
+      for(let p of tempPoints.slice(1)) ctx.lineTo(p.x,p.y);
+      if(previewPoint) ctx.lineTo(previewPoint.x,previewPoint.y);
+      ctx.closePath();
+      ctx.fill(); ctx.stroke();
+    } else {
+      ctx.setLineDash([6,6]);
+      ctx.beginPath();
+      ctx.moveTo(tempPoints[0].x,tempPoints[0].y);
+      for(let p of tempPoints.slice(1)) ctx.lineTo(p.x,p.y);
+      if(previewPoint) ctx.lineTo(previewPoint.x,previewPoint.y);
+      ctx.stroke(); ctx.setLineDash([]);
+      let total=0;
+      for(let i=1;i<tempPoints.length;i++) total+=distance(tempPoints[i-1],tempPoints[i]);
+      if(previewPoint) total+=distance(tempPoints[tempPoints.length-1],previewPoint);
+      ctx.fillStyle='white';
+      ctx.fillText(Math.round(total*100)+' м', previewPoint.x+5, previewPoint.y-5);
+    }
+  }
+}
+
+function drawGrid(){
+  ctx.strokeStyle='rgba(255,255,255,0.1)';
+  const step=100;
+  const width=mapImage?mapImage.width:canvas.width;
+  const height=mapImage?mapImage.height:canvas.height;
+  for(let x=0;x<width;x+=step){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,height);ctx.stroke();}
+  for(let y=0;y<height;y+=step){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(width,y);ctx.stroke();}
+}
+
+function drawObject(o){
+  ctx.save();
+  ctx.fillStyle=o.color;
+  ctx.strokeStyle=o.color;
+  ctx.lineWidth=2;
+  switch(o.type){
+    case 'circle': ctx.beginPath(); ctx.arc(o.x,o.y,o.size,0,Math.PI*2); ctx.fill(); break;
+    case 'square': ctx.fillRect(o.x-o.size,o.y-o.size,o.size*2,o.size*2); break;
+    case 'diamond': ctx.beginPath(); ctx.moveTo(o.x,o.y-o.size); ctx.lineTo(o.x+o.size,o.y); ctx.lineTo(o.x,o.y+o.size); ctx.lineTo(o.x-o.size,o.y); ctx.closePath(); ctx.fill(); break;
+    case 'triangle': ctx.beginPath(); ctx.moveTo(o.x,o.y-o.size); ctx.lineTo(o.x+o.size,o.y+o.size); ctx.lineTo(o.x-o.size,o.y+o.size); ctx.closePath(); ctx.fill(); break;
+    case 'radiation':
+      ctx.fillStyle='rgba(0,255,0,0.3)';
+      ctx.beginPath();
+      ctx.moveTo(o.x, o.y + o.size);
+      ctx.lineTo(o.x + o.size, o.y - o.size);
+      ctx.lineTo(o.x - o.size, o.y - o.size);
+      ctx.closePath();
+      ctx.fill(); ctx.stroke(); ctx.fillStyle=o.color; break;
+    case 'note':
+      ctx.fillStyle = o.textColor || 'white';
+      ctx.fillText(o.text, o.x, o.y);
+      break;
+    case 'zone':
+      ctx.fillStyle='rgba(255,0,0,0.2)';
+      ctx.beginPath(); ctx.moveTo(o.points[0].x,o.points[0].y); for(let p of o.points.slice(1)) ctx.lineTo(p.x,p.y); ctx.closePath(); ctx.fill(); ctx.stroke(); break;
+    case 'route':
+      ctx.setLineDash([6,6]); ctx.beginPath(); ctx.moveTo(o.points[0].x,o.points[0].y); for(let p of o.points.slice(1)) ctx.lineTo(p.x,p.y); ctx.stroke(); drawArrows(o.points); ctx.setLineDash([]); break;
+  }
+  if(o.text && (o.type==='circle'||o.type==='square'||o.type==='diamond'||o.type==='triangle'||o.type==='radiation')){
+    ctx.fillStyle = o.textColor || 'white';
+    ctx.fillText(o.text, o.x + o.size + 4, o.y + 4);
+  }
+  ctx.restore();
+}
+
+function distance(p1,p2){return Math.hypot(p1.x-p2.x,p1.y-p2.y);}
+function drawArrows(points){for(let i=0;i<points.length-1;i++){let p1=points[i],p2=points[i+1];let angle=Math.atan2(p2.y-p1.y,p2.x-p1.x);let len=10;ctx.beginPath();ctx.moveTo(p2.x,p2.y);ctx.lineTo(p2.x-len*Math.cos(angle-Math.PI/6), p2.y-len*Math.sin(angle-Math.PI/6));ctx.lineTo(p2.x-len*Math.cos(angle+Math.PI/6), p2.y-len*Math.sin(angle+Math.PI/6));ctx.closePath();ctx.fill();}}
+
+function canvasPoint(event){
+  const rect=canvas.getBoundingClientRect();
+  return {
+    x:(event.clientX-rect.left)*canvas.width/rect.width,
+    y:(event.clientY-rect.top)*canvas.height/rect.height
+  };
+}
+
+function mapPoint(event){
+  const point=canvasPoint(event);
+  const scale=zoom*mapScale;
+  return {x:(point.x-offsetX)/scale,y:(point.y-offsetY)/scale};
+}
+
+document.getElementById('toggleGrid').addEventListener('click',()=>{gridVisible=!gridVisible; requestDraw();
+;});
+document.getElementById('zoomIn').addEventListener('click',()=>{zoom*=1.1; requestDraw();
+;});
+document.getElementById('zoomOut').addEventListener('click',()=>{zoom/=1.1; requestDraw();
+;});
+
+document.getElementById('addMarker').addEventListener('click',()=>{currentAction='marker'; eraseMode=false;});
+document.getElementById('drawZone').addEventListener('click',()=>{currentAction='zone'; tempPoints=[]; eraseMode=false;});
+document.getElementById('drawRoute').addEventListener('click',()=>{currentAction='route'; tempPoints=[]; eraseMode=false;});
+document.getElementById('addNote').addEventListener('click',()=>{currentAction='note'; eraseMode=false;});
+document.getElementById('eraseElement').addEventListener('click',()=>{eraseMode=true; currentAction=null; tempPoints=[]; previewPoint=null;});
+document.getElementById('eraseAll').addEventListener('click',()=>{if(confirm('Видалити все?')){objects=[];tempPoints=[];previewPoint=null; queueSharedSave(); requestDraw();
+;}});
+
+canvas.addEventListener('mousedown',e=>{if(e.button===2){isPanning=true; panStart=canvasPoint(e); panOffsetStart={x:offsetX,y:offsetY};}});
+canvas.addEventListener('mouseup',e=>{if(e.button===2) isPanning=false;});
+canvas.addEventListener('mousemove',e=>{const point=canvasPoint(e); if(isPanning){offsetX=panOffsetStart.x+(point.x-panStart.x); offsetY=panOffsetStart.y+(point.y-panStart.y); requestDraw();
+; return;} if((currentAction==='zone'||currentAction==='route') && tempPoints.length>0){previewPoint=mapPoint(e); requestDraw();
+;}});
+
+canvas.addEventListener('contextmenu',e=>e.preventDefault());
+canvas.addEventListener('click', e => {
+  if (e.button !== 0 || currentRole !== 'editor') return;
+  const {x,y} = mapPoint(e);
+  const color = document.getElementById('colorPicker').value;
+  const size = parseInt(document.getElementById('markerSize').value) || 20;
+  const textColor = (document.getElementById('textColorPicker') && document.getElementById('textColorPicker').value) || 'white';
+
+  if (eraseMode) {
+    for (let i = objects.length - 1; i >= 0; i--) {
+      let o = objects[i];
+      if (o.type === 'note' && x >= o.x - 10 && x <= o.x + 50 && y >= o.y - 10 && y <= o.y + 10) { objects.splice(i, 1); break; }
+      else if (o.type === 'circle' && Math.hypot(x - o.x, y - o.y) <= o.size) { objects.splice(i, 1); break; }
+      else if (o.type === 'square' && x >= o.x - o.size && x <= o.x + o.size && y >= o.y - o.size && y <= o.y + o.size) { objects.splice(i, 1); break; }
+      else if (o.type === 'diamond' && x >= o.x - o.size && x <= o.x + o.size && y >= o.y - o.size && y <= o.y + o.size) { objects.splice(i, 1); break; }
+      else if (o.type === 'triangle' && x >= o.x - o.size && x <= o.x + o.size && y >= o.y - o.size && y <= o.y + o.size) { objects.splice(i, 1); break; }
+      else if (o.type === 'radiation' && x >= o.x - o.size && x <= o.x + o.size && y >= o.y - o.size && y <= o.y + o.size) { objects.splice(i, 1); break; }
+      else if (o.type === 'zone' || o.type === 'route') {
+        for (let p of o.points) {
+          if (Math.hypot(p.x - x, p.y - y) <= 10) { objects.splice(i, 1); break; }
+        }
+      }
+    }
+    queueSharedSave();
+    requestDraw();
+    return;
+  }
+
+  if (currentAction === 'marker') {
+    const shape = document.getElementById('shapeType').value;
+    let text = '';
+    if (shape !== 'radiation') text = prompt('Назва мітки:') || '';
+    objects.push({ type: shape, x, y, color, size, text, textColor });
+    queueSharedSave();
+  } else if (currentAction === 'zone' || currentAction === 'route') {
+    tempPoints.push({ x, y });
+  } else if (currentAction === 'note') {
+    const text = prompt('Введіть текст нотатки:');
+    if (text){
+      objects.push({ type: 'note', x, y, text, color, textColor });
+      queueSharedSave();
+    }
+  }
+
+  requestDraw();
+});
+
+canvas.addEventListener('dblclick',()=>{finalizeShape();});
+
+document.addEventListener('keydown',e=>{if(e.key==='Enter') finalizeShape(); if(e.key==='Backspace'){tempPoints.pop(); requestDraw();
+;}});
+
+function finalizeShape(){if(currentRole === 'editor' && currentAction==='zone' && tempPoints.length>2){objects.push({type:'zone',points:[...tempPoints],color:document.getElementById('colorPicker').value}); queueSharedSave();} else if(currentRole === 'editor' && currentAction==='route' && tempPoints.length>1){objects.push({type:'route',points:[...tempPoints],color:document.getElementById('colorPicker').value}); queueSharedSave();} tempPoints=[]; previewPoint=null; requestDraw();
+;}
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+
+  const point = canvasPoint(e);
+
+  const worldX = (point.x - offsetX) / (zoom*mapScale);
+  const worldY = (point.y - offsetY) / (zoom*mapScale);
+
+  const scaleFactor = e.deltaY < 0 ? 1.1 : 0.9;
+
+  const newZoom = zoom * scaleFactor;
+
+  if(newZoom < 0.2 || newZoom > 5) return;
+
+  zoom = newZoom;
+
+  offsetX = point.x - worldX * zoom * mapScale;
+  offsetY = point.y - worldY * zoom * mapScale;
+
+  requestDraw();
+;
+}, { passive: false });
+
+document.getElementById('saveMap').addEventListener('click',()=>{
+  const data = {
+    objects: objects
+  };
+
+  const blob = new Blob(
+    [JSON.stringify(data)],
+    {type:'application/json'}
+  );
+
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'map.maptacmd';
+  a.click();
+});
+requestDraw();
+initializeAccess();
+document.getElementById('loadMap').addEventListener('click', () => {
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = '.maptacmd';
+
+  inp.onchange = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+
+    reader.onload = ev => {
+      try {
+        const data = JSON.parse(ev.target.result);
+
+        if (!data.objects || !Array.isArray(data.objects)) {
+          alert("Невірний формат файлу");
+          return;
+        }
+
+        objects = data.objects;
+        tempPoints = [];
+        previewPoint = null;
+        queueSharedSave();
+
+        requestDraw ? requestDraw() : draw();
+
+      } catch (err) {
+        alert("Помилка завантаження файлу");
+        console.error(err);
+      }
+    };
+
+    reader.readAsText(file);
+  };
+
+  inp.click();
+});
+</script>
+</body>
+</html>
